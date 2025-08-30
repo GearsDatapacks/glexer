@@ -3,6 +3,7 @@ import gleam/list
 import gleam/result
 import gleam/string
 import glexer/token.{type Token}
+import splitter
 
 pub opaque type Lexer {
   Lexer(
@@ -16,6 +17,7 @@ pub opaque type Lexer {
     preserve_whitespace: Bool,
     preserve_comments: Bool,
     mode: LexerMode,
+    newlines: splitter.Splitter,
   )
 }
 
@@ -28,7 +30,12 @@ type LexerMode {
 }
 
 pub type Position {
-  Position(byte_offset: Int)
+  Position(
+    /// Despite being named 'byte_offset', this isn't actually a 'byte_offset'
+    /// on JavaScript. Strings on JavaScript are utf-16, so this is actually
+    /// more like a 'codeunit' offset.
+    byte_offset: Int,
+  )
 }
 
 pub fn new(source: String) -> Lexer {
@@ -39,6 +46,7 @@ pub fn new(source: String) -> Lexer {
     preserve_whitespace: True,
     preserve_comments: True,
     mode: Normal,
+    newlines: splitter.new(["\r\n", "\n"]),
   )
 }
 
@@ -129,7 +137,7 @@ fn next(lexer: Lexer) -> #(Lexer, #(Token, Position)) {
             False -> skip_comment(lexer)
             True ->
               advance(lexer, source, 4)
-              |> comment(ModuleComment, lexer.byte_offset, 0)
+              |> comment(ModuleComment, lexer.byte_offset)
           }
 
         "///" <> source ->
@@ -137,7 +145,7 @@ fn next(lexer: Lexer) -> #(Lexer, #(Token, Position)) {
             False -> skip_comment(lexer)
             True ->
               advance(lexer, source, 3)
-              |> comment(DocComment, lexer.byte_offset, 0)
+              |> comment(DocComment, lexer.byte_offset)
           }
 
         "//" <> source ->
@@ -145,7 +153,7 @@ fn next(lexer: Lexer) -> #(Lexer, #(Token, Position)) {
             False -> skip_comment(lexer)
             True ->
               advance(lexer, source, 2)
-              |> comment(RegularComment, lexer.byte_offset, 0)
+              |> comment(RegularComment, lexer.byte_offset)
           }
 
         // Groupings
@@ -363,7 +371,7 @@ fn next(lexer: Lexer) -> #(Lexer, #(Token, Position)) {
                 lexer,
                 token.UnexpectedGrapheme(grapheme),
                 source,
-                string.byte_size(grapheme),
+                length(grapheme),
               )
             }
           }
@@ -587,45 +595,31 @@ fn whitespace(
 /// token.
 ///
 fn skip_comment(lexer: Lexer) -> #(Lexer, #(Token, Position)) {
-  // Here we're dropping bytes until we get to a `\n` or `\r\n` character.
-  // While dropping bytes we might end up with a string that is not UTF8
-  // encoded. But we know, after finding a newline character we're back to
-  // dealing with a regular UTF8 string and can safely keep going.
-  //
-  // So the trick is the byte dropping is well confined in this loop that
-  // only ever ends after we're back in valid string territory. The same goes
-  // for other functions like `comment` and `lex_string`!
-  case lexer.source {
-    "" | "\n" <> _ | "\r\n" <> _ -> next(lexer)
-    _ -> skip_comment(advance(lexer, drop_byte(lexer.source), 1))
-  }
+  let #(prefix, suffix) = splitter.split_before(lexer.newlines, lexer.source)
+
+  let eaten = length(prefix)
+  let lexer = advance(lexer, suffix, eaten)
+
+  next(lexer)
 }
 
 fn comment(
   lexer: Lexer,
   kind: CommentKind,
   start: Int,
-  slice_size: Int,
 ) -> #(Lexer, #(Token, Position)) {
-  case lexer.source {
-    "\n" <> _ | "\r\n" <> _ | "" -> {
-      let source = lexer.original_source
-      let token = case kind {
-        ModuleComment ->
-          token.CommentModule(slice_bytes(source, start + 4, slice_size))
-        DocComment ->
-          token.CommentDoc(slice_bytes(source, start + 3, slice_size))
-        RegularComment ->
-          token.CommentNormal(slice_bytes(source, start + 2, slice_size))
-      }
+  let #(prefix, suffix) = splitter.split_before(lexer.newlines, lexer.source)
 
-      #(lexer, #(token, Position(byte_offset: start)))
-    }
+  let eaten = length(prefix)
+  let lexer = advance(lexer, suffix, eaten)
 
-    _ ->
-      advance(lexer, drop_byte(lexer.source), 1)
-      |> comment(kind, start, slice_size + 1)
+  let token = case kind {
+    ModuleComment -> token.CommentModule(prefix)
+    DocComment -> token.CommentDoc(prefix)
+    RegularComment -> token.CommentNormal(prefix)
   }
+
+  #(lexer, #(token, Position(byte_offset: start)))
 }
 
 fn lex_binary(
@@ -785,7 +779,7 @@ fn lex_string(
           |> lex_string(start, slice_size + 1)
 
         Ok(#(grapheme, source)) -> {
-          let offset = 1 + string.byte_size(grapheme)
+          let offset = 1 + length(grapheme)
           advance(lexer, source, offset)
           |> lex_string(start, slice_size + offset)
         }
@@ -893,6 +887,11 @@ fn token(lexer: Lexer, token: Token, source: String, offset: Int) {
 // //////////////////// //
 // FFI String functions //
 // //////////////////// //
+
+@external(javascript, "./glexer.ffi.mjs", "string_length")
+fn length(string: String) -> Int {
+  string.byte_size(string)
+}
 
 /// > 🚨 Beware that this is tricking Gleam's type system! There's no guarantee
 /// > that taking a slice from an arbitrary byte index would result in a valid
